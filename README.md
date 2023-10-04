@@ -1,2 +1,2 @@
 # detr-s
-Detector Transfomer simple-version
+Detection Transfomer simple-version
