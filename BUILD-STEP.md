@@ -441,3 +441,370 @@ cumsum_result = x.cumsum(dim=0)
 print("Cumulative Sum Result:", cumsum_result)
 # 输出: Cumulative Sum Result: tensor([ 1,  3,  6, 10, 15])
 ```
+
+### Transformer
+
+<div align=center>
+<img src=".github/Transformer.png" width = "50%" height = "50%" alt="Transformer" align=center>
+</div>
+
+
+### Transformer Encoder
+
+在上文中，我们获得了两个矩阵，一个矩阵是输入图片的特征矩阵，一个是特征矩阵对应的位置编码。它们的shape分别为[batch_size, 2048, 25, 25]、[batch_size, 256, 25, 25]。
+
+在编码网络部分，DETR使用Transformer的Encoder部分进行特征提取。我们需要首先对特征矩阵进行通道的缩放，如果直接对特征矩阵进行transformer的特征提取的话，由于网络的通道数太大（2048），会直接导致显存不足。**利用一个[256x2048x1x1]的nn.Conv2d点卷积**进行通道的压缩，压缩后的通道为256，即Transformer用到的特征长度。此时我们获得了一个shape为[batch_size, 256, 25, 25]的特征矩阵。
+
+然后我们对特征矩阵与位置编码的高宽维度进行平铺获得两个shape为[batch_size, 256, 625]的矩阵，由于我们使用的是**Pytorch自带的nn.MultiheadAttention**，该模块要求batch_size位于第1维，序列长度位于第0维，所以我们将特征矩阵与位置编码进行转置，转置后的两个矩阵为[625, batch_size, 256]。
+
+我们此时可以将其输入到Encoder当中进行特征提取。Encoder并不会改变输入的shape，因此经过Encoder进行特征提取的加强后的特征序列shape也为[625, batch_size, 256]。
+
+```python
+class TransformerEncoder(nn.Module):
+    '''
+    encoder_layer: TransformerEncoderLayer类型的编码器层
+    num_layers: 编码器层数 n
+    norm: 归一化操作
+    '''
+    def __init__(self, encoder_layer, num_layers, norm=None):
+        super().__init__()
+        self.layers = _get_clones(encoder_layer, num_layers)
+        self.num_layers = num_layers
+        self.norm = norm
+
+    def forward(self, src,
+                mask: Optional[Tensor] = None,
+                src_key_padding_mask: Optional[Tensor] = None,
+                pos: Optional[Tensor] = None):
+        output = src
+
+        for layer in self.layers:
+            output = layer(output, src_mask=mask,
+                           src_key_padding_mask=src_key_padding_mask, pos=pos)
+
+        if self.norm is not None:
+            output = self.norm(output)
+
+        return output
+
+def _get_clones(module, N):
+    return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
+
+def _get_activation_fn(activation):
+    """Return an activation function given a string"""
+    if activation == "relu":
+        return F.relu
+    if activation == "gelu":
+        return F.gelu
+    if activation == "glu":
+        return F.glu
+    raise RuntimeError(F"activation should be relu/gelu, not {activation}.")
+
+class TransformerEncoderLayer(nn.Module):
+    '''
+    d_model: 输入特征的维度
+    nhead: 多头注意力的头数
+    dim_feedforward: 前馈神经网络隐藏层的维度
+    dropout: dropout操作的概率
+    activation: 前馈神经网络的激活函数类型
+    normalize_before: 归一化操作是否在前
+    '''
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
+                 activation="relu", normalize_before=False):
+        super().__init__()
+
+        # 多头自注意力层
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        # 前馈神经网络层
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        # 层归一化层
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        # Dropout层
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        # 激活函数
+        self.activation = _get_activation_fn(activation)
+        # 归一化操作前后
+        self.normalize_before = normalize_before
+
+    def with_pos_embed(self, tensor, pos: Optional[Tensor]):
+        return tensor if pos is None else tensor + pos
+
+    def forward_post(self,
+                     src,
+                     src_mask: Optional[Tensor] = None,
+                     src_key_padding_mask: Optional[Tensor] = None,
+                     pos: Optional[Tensor] = None):
+        # 查询和键直接使用 输入嵌入+位置嵌入
+        q = k = self.with_pos_embed(src, pos)
+        # 多头自注意力，值 使用源输入
+        # self.self_attn调用它时会返回一个元组，其中包含了注意力计算的结果和注意力权重
+        src2 = self.self_attn(q, k, value=src, attn_mask=src_mask,
+                              key_padding_mask=src_key_padding_mask)[0]
+        # 残差连接
+        src = src + self.dropout1(src2)
+        # 层归一化
+        src = self.norm1(src)
+
+        # 全连接前馈网络
+        # 625, batch_size, 256 => 625, batch_size, 2048 => 625, batch_size, 256
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        # 残差连接
+        src = src + self.dropout2(src2)
+        # 层归一化
+        src = self.norm2(src)
+        return src
+
+    def forward_pre(self, src,
+                    src_mask: Optional[Tensor] = None,
+                    src_key_padding_mask: Optional[Tensor] = None,
+                    pos: Optional[Tensor] = None):
+        # 归一化在前
+        src2 = self.norm1(src)
+        q = k = self.with_pos_embed(src2, pos)
+        src2 = self.self_attn(q, k, value=src2, attn_mask=src_mask,
+                              key_padding_mask=src_key_padding_mask)[0]
+        src = src + self.dropout1(src2)
+        src2 = self.norm2(src)
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(src2))))
+        src = src + self.dropout2(src2)
+        return src
+
+    def forward(self, src,
+                src_mask: Optional[Tensor] = None,
+                src_key_padding_mask: Optional[Tensor] = None,
+                pos: Optional[Tensor] = None):
+        if self.normalize_before:
+            return self.forward_pre(src, src_mask, src_key_padding_mask, pos)
+        return self.forward_post(src, src_mask, src_key_padding_mask, pos)
+```
+
+**MultiheadAttention 多头自注意力**
+
+一个序列产生三个单位输入，每一个序列单位的输入都可以通过三个处理（比如全连接）获得Query、Key、Value。Query是查询向量、Key是键向量、Value值向量。
+
+<div align=center>
+<img src=".github/selfAtten.gif" width = "80%" height = "80%" alt="Transformer" align=center>
+</div>
+
+1. 利用input-1的查询向量，分别乘上input-1、input-2、input-3的键向量，此时我们获得了三个score。
+2. 然后对这三个score取softmax，获得了input-1、input-2、input-3各自的重要程度。
+3. 然后将这个重要程度乘上input-1、input-2、input-3的值向量，求和。
+4. 此时我们获得了input-1的输出。
+
+在使用自注意力计算相关性的时候，就是用 q 去找相关的k。但是相关有很多种不同的形式，所以也许可以有多个 q，不同的 q 负责不同种类的相关
+性，这就是多头注意力。
+
+<div align=center>
+<img src=".github/MultiHeadAtten.png" width = "50%" height = "50%" alt="Transformer" align=center>
+</div>
+
+### Transformer Decoder
+
+通过上述编码步骤，我们可以获得一个利用Encoder加强特征提取后的特征矩阵，它的shape为[625, batch_size, 256]。
+
+在encoder部分获得的一个加强后的有效特征层会在这一部分进行解码，解码需要使用到一个非常重要的可学习模块，即上图呈现的object queries。在decoder部分，我们使用一个可学习的查询向量q对加强后的有效特征层进行查询，获得预测结果。
+
+在实际构建时，我们首先利用nn.Embedding(num_queries, hidden_dim)创建一个Embedding类别，然后利用.weight获取这个Embedding的权重作为可学习的查询向量query_embed。默认的num_queries值为100，hidden_dim值为256。因此查询向量query_embed本质上是一个[100, 256]的矩阵。加上batch维度后变成[100, batch_size, 256]。
+
+另外，我们还通过tgt = torch.zeros_like(query_embed)创建了一个与查询向量一样shape的矩阵，作为输入。
+
+参考右边Transformer Decoder的结构，tgt作为Output Embedding输入到Decoder中，query_embed作为Positional Encoding输入到Decoder中。
+
+首先自我进行一个Self-Attention的结构，输入是[100, batch_size, 256]，输出也是[100, batch_size, 256]。
+然后再次利用另一个Self-Attention，将刚刚获得的[100, batch_size, 256]输出作为Self-Attention的q，Encoder加强特征提取后的特征矩阵作为Self-Attention的k、v，进行特征提取。这个过程可以理解为使用查询向量对Self-Attention的k、v进行查询。由于查询向量q的序列长度为100，无论k、v的序列长度为多少，最终输出的序列长度都为100。
+
+因此对于解码网络Decoder而言，输出的序列shape为[100, batch_size, 256]。
+
+```python
+class TransformerDecoder(nn.Module):
+
+    def __init__(self, decoder_layer, num_layers, norm=None, return_intermediate=False):
+        super().__init__()
+        self.layers = _get_clones(decoder_layer, num_layers)
+        self.num_layers = num_layers
+        self.norm = norm
+        self.return_intermediate = return_intermediate
+
+    def forward(self, tgt, memory,
+                tgt_mask: Optional[Tensor] = None,
+                memory_mask: Optional[Tensor] = None,
+                tgt_key_padding_mask: Optional[Tensor] = None,
+                memory_key_padding_mask: Optional[Tensor] = None,
+                pos: Optional[Tensor] = None,
+                query_pos: Optional[Tensor] = None):
+        output = tgt
+
+        intermediate = []
+
+        for layer in self.layers:
+            output = layer(output, memory, tgt_mask=tgt_mask,
+                           memory_mask=memory_mask,
+                           tgt_key_padding_mask=tgt_key_padding_mask,
+                           memory_key_padding_mask=memory_key_padding_mask,
+                           pos=pos, query_pos=query_pos)
+            if self.return_intermediate:
+                intermediate.append(self.norm(output))
+
+        if self.norm is not None:
+            output = self.norm(output)
+            if self.return_intermediate:
+                intermediate.pop()
+                intermediate.append(output)
+
+        if self.return_intermediate:
+            return torch.stack(intermediate)
+
+        return output.unsqueeze(0)
+
+class TransformerDecoderLayer(nn.Module):
+
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
+                 activation="relu", normalize_before=False):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        # Implementation of Feedforward model
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+        self.activation = _get_activation_fn(activation)
+        self.normalize_before = normalize_before
+
+    def with_pos_embed(self, tensor, pos: Optional[Tensor]):
+        return tensor if pos is None else tensor + pos
+
+    def forward_post(self, tgt, memory,
+                     tgt_mask: Optional[Tensor] = None,
+                     memory_mask: Optional[Tensor] = None,
+                     tgt_key_padding_mask: Optional[Tensor] = None,
+                     memory_key_padding_mask: Optional[Tensor] = None,
+                     pos: Optional[Tensor] = None,
+                     query_pos: Optional[Tensor] = None):
+        # 首先一次自注意力，查询和键均取 输出嵌入+可学习的查询向量 query_pos=query_embed
+        # 100, batch_size, 256 => 100, batch_size, 256
+        q = k = self.with_pos_embed(tgt, query_pos)
+        tgt2 = self.self_attn(q, k, value=tgt, attn_mask=tgt_mask,
+                              key_padding_mask=tgt_key_padding_mask)[0]
+        # 残差连接与层归一化
+        tgt = tgt + self.dropout1(tgt2)
+        tgt = self.norm1(tgt)
+
+        # 自注意力，掩码
+        tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt, query_pos),
+                                   key=self.with_pos_embed(memory, pos),
+                                   value=memory, attn_mask=memory_mask,
+                                   key_padding_mask=memory_key_padding_mask)[0]
+        
+        # 残差连接与层归一化
+        tgt = tgt + self.dropout2(tgt2)
+        tgt = self.norm2(tgt)
+        # 全连接前馈网络
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+        tgt = tgt + self.dropout3(tgt2)
+        tgt = self.norm3(tgt)
+        return tgt
+
+    def forward_pre(self, tgt, memory,
+                    tgt_mask: Optional[Tensor] = None,
+                    memory_mask: Optional[Tensor] = None,
+                    tgt_key_padding_mask: Optional[Tensor] = None,
+                    memory_key_padding_mask: Optional[Tensor] = None,
+                    pos: Optional[Tensor] = None,
+                    query_pos: Optional[Tensor] = None):
+        tgt2 = self.norm1(tgt)
+        q = k = self.with_pos_embed(tgt2, query_pos)
+        tgt2 = self.self_attn(q, k, value=tgt2, attn_mask=tgt_mask,
+                              key_padding_mask=tgt_key_padding_mask)[0]
+        tgt = tgt + self.dropout1(tgt2)
+        tgt2 = self.norm2(tgt)
+        tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt2, query_pos),
+                                   key=self.with_pos_embed(memory, pos),
+                                   value=memory, attn_mask=memory_mask,
+                                   key_padding_mask=memory_key_padding_mask)[0]
+        tgt = tgt + self.dropout2(tgt2)
+        tgt2 = self.norm3(tgt)
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
+        tgt = tgt + self.dropout3(tgt2)
+        return tgt
+
+    def forward(self, tgt, memory,
+                tgt_mask: Optional[Tensor] = None,
+                memory_mask: Optional[Tensor] = None,
+                tgt_key_padding_mask: Optional[Tensor] = None,
+                memory_key_padding_mask: Optional[Tensor] = None,
+                pos: Optional[Tensor] = None,
+                query_pos: Optional[Tensor] = None):
+        if self.normalize_before:
+            return self.forward_pre(tgt, memory, tgt_mask, memory_mask,
+                                    tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos)
+        return self.forward_post(tgt, memory, tgt_mask, memory_mask,
+                                 tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos)
+```
+
+至此，我们可以构建完整的Transformer结构
+
+```python
+class Transformer(nn.Module):
+
+    def __init__(self, d_model=512, nhead=8, num_encoder_layers=6,
+                 num_decoder_layers=6, dim_feedforward=2048, dropout=0.1,
+                 activation="relu", normalize_before=False,
+                 return_intermediate_dec=False):
+        super().__init__()
+
+        encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward,
+                                                dropout, activation, normalize_before)
+        encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
+        self.encoder = TransformerEncoder(encoder_layer, num_encoder_layers, encoder_norm)
+
+        decoder_layer = TransformerDecoderLayer(d_model, nhead, dim_feedforward,
+                                                dropout, activation, normalize_before)
+        decoder_norm = nn.LayerNorm(d_model)
+        self.decoder = TransformerDecoder(decoder_layer, num_decoder_layers, decoder_norm,
+                                          return_intermediate=return_intermediate_dec)
+
+        self._reset_parameters()
+
+        self.d_model = d_model
+        self.nhead = nhead
+
+    def _reset_parameters(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def forward(self, src, mask, query_embed, pos_embed):
+        '''
+        query、key和value的维度为 (sequence_length, batch_size, embedding_dim)
+        sequence_length 表示序列的长度，即输入序列的时间/空间步数。
+        batch_size 表示批次大小，即同时处理的样本数量。
+        embedding_dim 表示每个时间/空间步的嵌入维度或特征维度。
+        attn_mask 和 key_padding_mask 的维度为 (batch_size, sequence_length) 或 (batch_size, 1, sequence_length)。
+        attn_mask 用于在注意力计算中屏蔽无效的位置，而 key_padding_mask 用于屏蔽键序列中的填充位置。
+        '''
+        # flatten NxCxHxW to HWxNxC
+        bs, c, h, w = src.shape
+        src = src.flatten(2).permute(2, 0, 1)
+        pos_embed = pos_embed.flatten(2).permute(2, 0, 1)
+        query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
+        mask = mask.flatten(1)
+        # mask = mask.unsqueeze(1)
+
+        tgt = torch.zeros_like(query_embed)
+        memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
+        hs = self.decoder(tgt, memory, memory_key_padding_mask=mask,
+                          pos=pos_embed, query_pos=query_embed)
+        return hs.transpose(1, 2), memory.permute(1, 2, 0).view(bs, c, h, w)
+```
