@@ -87,6 +87,13 @@ def get_args_parser():
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
     return parser
 
+'''
+python -m torch.distributed.launch --nproc_per_node=3 \
+    --use_env train.py --coco_path /data/COCO2017/images/  \
+    --output_dir run/box_model \
+    --epochs 3 --device cuda --num_workers 8 --batch_size 2
+'''
+
 def main(args):
     trainer = Trainer(args)
     trainer.train()

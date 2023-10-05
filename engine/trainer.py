@@ -14,11 +14,14 @@ from data.datasets import build_dataset, get_coco_api_from_dataset
 
 class Trainer:
     def __init__(self, args):
+        # utils.init_distributed_mode(args)
+        # print("git:\n  {}\n".format(utils.get_sha()))
         self.args = args
         self.device = torch.device(args.device)
         self.model, self.criterion, self.postprocessors = self.build_mcp(args)
         self.model.to(self.device)
-        self.model_without_ddp = self.model.module if args.distributed else self.model
+        # self.model_without_ddp = self.model.module if args.distributed else self.model
+        self.model_without_ddp = self.model
         self.optimizer, self.lr_scheduler = self.build_optimizer(args)
         self.dataset_train = build_dataset(image_set='train', args=args)
         self.dataset_val = build_dataset(image_set='val', args=args)
@@ -48,10 +51,11 @@ class Trainer:
         return optimizer, lr_scheduler
 
     def build_data_loader(self, dataset, is_train):
-        if self.args.distributed:
-            sampler = DistributedSampler(dataset)
-        else:
-            sampler = torch.utils.data.RandomSampler(dataset) if is_train else torch.utils.data.SequentialSampler(dataset)
+        # if self.args.distributed:
+        #     sampler = DistributedSampler(dataset)
+        # else:
+        #     sampler = torch.utils.data.RandomSampler(dataset) if is_train else torch.utils.data.SequentialSampler(dataset)
+        sampler = torch.utils.data.RandomSampler(dataset) if is_train else torch.utils.data.SequentialSampler(dataset)
 
         if is_train:
             batch_sampler = torch.utils.data.BatchSampler(sampler, self.args.batch_size, drop_last=True)
@@ -74,6 +78,7 @@ class Trainer:
         print_freq = 10
 
         for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
+        # for samples, targets in data_loader:
             samples = samples.to(device)
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
@@ -117,21 +122,28 @@ class Trainer:
         n_parameters = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         print('number of params:', n_parameters)
         for epoch in range(self.args.start_epoch, self.args.epochs):
-            if self.args.distributed:
-                self.data_loader_train.sampler.set_epoch(epoch)
-            train_stats = self.train_one_epoch(epoch)
+            # if self.args.distributed:
+            #     self.data_loader_train.sampler.set_epoch(epoch)
+            train_stats = self.train_one_epoch(self.model, self.criterion, self.data_loader_train, 
+                                               self.optimizer, self.device, epoch,self.args.clip_max_norm)
             self.lr_scheduler.step()
             if self.args.output_dir:
                 checkpoint_paths = [self.args.output_dir / 'checkpoint.pth']
                 if (epoch + 1) % self.args.lr_drop == 0 or (epoch + 1) % 100 == 0:
                     checkpoint_paths.append(self.args.output_dir / f'checkpoint{epoch:04}.pth')
                 for checkpoint_path in checkpoint_paths:
-                    self.save_checkpoint(checkpoint_path, epoch)
+                    utils.save_on_master({
+                    'model': self.model_without_ddp.state_dict(),
+                    'optimizer': self.optimizer.state_dict(),
+                    'lr_scheduler': self.lr_scheduler.state_dict(),
+                    'epoch': epoch,
+                    'args': self.args,
+                }, checkpoint_path)
 
-            test_stats = self.evaluate()
+            # test_stats = self.evaluate()
 
             log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                         **{f'test_{k}': v for k, v in test_stats.items()},
+                        #  **{f'test_{k}': v for k, v in test_stats.items()},
                          'epoch': epoch}
 
             if self.args.output_dir and utils.is_main_process():
