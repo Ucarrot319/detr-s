@@ -1,10 +1,10 @@
 # 从头开始构建DETR网络
 
-来自文章[End-to-End Object Detection with Transformers](https://scontent-hkg4-1.xx.fbcdn.net/v/t39.2365-6/154305880_816694605586461_2873294970659239190_n.pdf?_nc_cat=108&ccb=1-7&_nc_sid=3c67a6&_nc_ohc=7kbGRIBAKBgAX-YDqBc&_nc_ht=scontent-hkg4-1.xx&oh=00_AfDTc8IvCPPdbB9EaI5dxC1D6BX6XYXmDruSfxcmlNGttQ&oe=6521EF03)
+来自文章 ["End-to-End Object Detection with Transformers"](https://scontent-hkg4-1.xx.fbcdn.net/v/t39.2365-6/154305880_816694605586461_2873294970659239190_n.pdf?_nc_cat=108&ccb=1-7&_nc_sid=3c67a6&_nc_ohc=7kbGRIBAKBgAX-YDqBc&_nc_ht=scontent-hkg4-1.xx&oh=00_AfDTc8IvCPPdbB9EaI5dxC1D6BX6XYXmDruSfxcmlNGttQ&oe=6521EF03)
 
-源码参考[facebookresearch/detr](https://github.com/facebookresearch/detr)
+源码参考 [[github]facebookresearch/detr](https://github.com/facebookresearch/detr)
 
-解析参考[Bubbliiiing的CSDN](https://blog.csdn.net/weixin_44791964/article/details/128361674)
+解析参考 [Bubbliiiing的CSDN](https://blog.csdn.net/weixin_44791964/article/details/128361674)
 
 ## 整体结构解析
 
@@ -442,6 +442,27 @@ print("Cumulative Sum Result:", cumsum_result)
 # 输出: Cumulative Sum Result: tensor([ 1,  3,  6, 10, 15])
 ```
 
+#### 结合特征与位置编码
+
+将backbone输出的特征图与位置编码组合为输入Transformer模型做准备
+
+```python
+class Joiner(nn.Sequential):
+    def __init__(self, backbone, position_embedding):
+        super().__init__(backbone, position_embedding)
+
+    def forward(self, tensor_list: NestedTensor):
+        xs = self[0](tensor_list)
+        out: List[NestedTensor] = []
+        pos = []
+        for name, x in xs.items():
+            out.append(x)
+            # position encoding
+            pos.append(self[1](x).to(x.tensors.dtype))
+
+        return out, pos
+```
+
 ### Transformer
 
 <div align=center>
@@ -449,7 +470,7 @@ print("Cumulative Sum Result:", cumsum_result)
 </div>
 
 
-### Transformer Encoder
+#### Transformer Encoder
 
 在上文中，我们获得了两个矩阵，一个矩阵是输入图片的特征矩阵，一个是特征矩阵对应的位置编码。它们的shape分别为[batch_size, 2048, 25, 25]、[batch_size, 256, 25, 25]。
 
@@ -602,7 +623,7 @@ class TransformerEncoderLayer(nn.Module):
 <img src=".github/MultiHeadAtten.png" width = "50%" height = "50%" alt="Transformer" align=center>
 </div>
 
-### Transformer Decoder
+#### Transformer Decoder
 
 通过上述编码步骤，我们可以获得一个利用Encoder加强特征提取后的特征矩阵，它的shape为[625, batch_size, 256]。
 
@@ -807,4 +828,331 @@ class Transformer(nn.Module):
         hs = self.decoder(tgt, memory, memory_key_padding_mask=mask,
                           pos=pos_embed, query_pos=query_embed)
         return hs.transpose(1, 2), memory.permute(1, 2, 0).view(bs, c, h, w)
+```
+
+**nn.Embedding**
+
+
+### Prediction Head
+
+解码网络Decoder的输出为[100, batch_size, 256]，在实际使用时，为了方便，我们再次把batch_size放回第0维度，得到的矩阵为：[batch_size, 100, 256]
+
+prediction heads是DETR的分类器与回归器，其实就是对decoder获得的预测结果进行全连接，两次全连接分别代表种类和回归参数。图上画了4个FFN，源码中是2个FFN。
+
+其中输出分类信息的头，它最终的全连接神经元个数为num_classes + 1，num_classes代表要区分的类别数量，+1代表背景类。
+
+- 如果使用的是voc训练集，类则为20种，最后的维度应该为21。
+
+- 如果使用的是coco训练集，类则为80种，不过中间有一些为空的种类，空种类有11个，最后的维度应该为80+11+1=92。
+
+因此分类信息头的输出shape为[batch_size, 100, num_classes + 1]
+
+其中输出回归信息的头，它最终的全连接神经元个数为4。输出时会取一个sigmoid。前两个系数代表中心点坐标，后两个系数代表预测框宽高。因此分类信息头的输出shape为[batch_size, 100, 4]
+
+具体实现如下：
+
+```python
+class MLP(nn.Module):
+    """ Very simple multi-layer perceptron (also called FFN)多层感知器"""
+
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
+        super().__init__()
+        self.num_layers = num_layers
+        # 将隐藏层维度扩展成 (num_layers - 1) 长的列表
+        h = [hidden_dim] * (num_layers - 1)
+        # 将输入维度[input_dim] 与 h 拼接，即表示前一层的输入维度的列表
+        self.layers = nn.ModuleList(nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim]))
+
+    def forward(self, x):
+        for i, layer in enumerate(self.layers):
+            x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
+        return x
+```
+
+至此DETR模型的所有模块已经准备完成，可以搭建DETR了：
+
+```python
+class DETR(nn.Module):
+    """ This is the DETR module that performs object detection """
+    def __init__(self, backbone, transformer, num_classes, num_queries, aux_loss=False):
+        """ Initializes the model.
+        Parameters:
+            backbone: torch module of the backbone to be used. See backbone.py
+            transformer: torch module of the transformer architecture. See transformer.py
+            num_classes: number of object classes
+            num_queries: number of object queries, ie detection slot. This is the maximal number of objects
+                         DETR can detect in a single image. For COCO, we recommend 100 queries.
+            aux_loss: True if auxiliary decoding losses (loss at each decoder layer) are to be used.
+        """
+        super().__init__()
+        # 每个注意力头的查询数量，与注意力头的个数区分
+        self.num_queries = num_queries
+        self.transformer = transformer
+        # Transformer的输入维度
+        hidden_dim = transformer.d_model
+        # 输出分类信息
+        self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
+        # 输出回归信息
+        self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
+        # 传入Transformer进行查询的查询向量
+        self.query_embed = nn.Embedding(num_queries, hidden_dim)
+        # 传入Transformer的特征输入，需要与位置编码的特征通道相匹配
+        self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
+        # 主干网络
+        self.backbone = backbone
+        # 是否使用辅助分支
+        self.aux_loss = aux_loss
+
+    def forward(self, samples: NestedTensor):
+        """ The forward expects a NestedTensor, which consists of:
+               - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
+               - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
+
+            It returns a dict with the following elements:
+               - "pred_logits": the classification logits (including no-object) for all queries.
+                                Shape= [batch_size x num_queries x (num_classes + 1)]
+               - "pred_boxes": The normalized boxes coordinates for all queries, represented as
+                               (center_x, center_y, height, width). These values are normalized in [0, 1],
+                               relative to the size of each individual image (disregarding possible padding).
+                               See PostProcess for information on how to retrieve the unnormalized bounding box.
+               - "aux_outputs": Optional, only returned when auxilary losses are activated. It is a list of
+                                dictionnaries containing the two above keys for each decoder layer.
+        """
+        # 若输入不是NestedTensor先转换
+        if isinstance(samples, (list, torch.Tensor)):
+            samples = nested_tensor_from_tensor_list(samples)
+        features, pos = self.backbone(samples)
+        
+        # 特征图可能有中间多层网络的输出，取最后一层的输出
+        src, mask = features[-1].decompose()
+        assert mask is not None
+        hs = self.transformer(self.input_proj(src), mask, self.query_embed.weight, pos[-1])[0]
+
+        outputs_class = self.class_embed(hs)
+        outputs_coord = self.bbox_embed(hs).sigmoid()
+        out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+        if self.aux_loss:
+            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
+        return out
+
+    @torch.jit.unused
+    def _set_aux_loss(self, outputs_class, outputs_coord):
+        # this is a workaround to make torchscript happy, as torchscript
+        # doesn't support dictionary with non-homogeneous values, such
+        # as a dict having both a Tensor and a list.
+        return [{'pred_logits': a, 'pred_boxes': b}
+                for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
+
+```
+
+需要用到tensor转nested_tensor:
+
+```python
+def nested_tensor_from_tensor_list(tensor_list: List[Tensor]):
+    # TODO make this more general
+    if tensor_list[0].ndim == 3:
+        if torchvision._is_tracing():
+            # nested_tensor_from_tensor_list() does not export well to ONNX
+            # call _onnx_nested_tensor_from_tensor_list() instead
+            return _onnx_nested_tensor_from_tensor_list(tensor_list)
+
+        # TODO make it support different-sized images
+        max_size = _max_by_axis([list(img.shape) for img in tensor_list])
+        # min_size = tuple(min(s) for s in zip(*[img.shape for img in tensor_list]))
+        batch_shape = [len(tensor_list)] + max_size
+        b, c, h, w = batch_shape
+        dtype = tensor_list[0].dtype
+        device = tensor_list[0].device
+        tensor = torch.zeros(batch_shape, dtype=dtype, device=device)
+        mask = torch.ones((b, h, w), dtype=torch.bool, device=device)
+        # 填充部分为True，原图部分为False
+        for img, pad_img, m in zip(tensor_list, tensor, mask):
+            pad_img[: img.shape[0], : img.shape[1], : img.shape[2]].copy_(img)
+            # 填充只在右下？
+            m[: img.shape[1], :img.shape[2]] = False
+    else:
+        raise ValueError('not supported')
+    return NestedTensor(tensor, mask)
+
+# _onnx_nested_tensor_from_tensor_list() is an implementation of
+# nested_tensor_from_tensor_list() that is supported by ONNX tracing. 导出ONNX时
+@torch.jit.unused
+def _onnx_nested_tensor_from_tensor_list(tensor_list: List[Tensor]) -> NestedTensor:
+    max_size = []
+    for i in range(tensor_list[0].dim()):
+        max_size_i = torch.max(torch.stack([img.shape[i] for img in tensor_list]).to(torch.float32)).to(torch.int64)
+        max_size.append(max_size_i)
+    max_size = tuple(max_size)
+
+    # work around for
+    # pad_img[: img.shape[0], : img.shape[1], : img.shape[2]].copy_(img)
+    # m[: img.shape[1], :img.shape[2]] = False
+    # which is not yet supported in onnx
+    padded_imgs = []
+    padded_masks = []
+    for img in tensor_list:
+        padding = [(s1 - s2) for s1, s2 in zip(max_size, tuple(img.shape))]
+        padded_img = torch.nn.functional.pad(img, (0, padding[2], 0, padding[1], 0, padding[0]))
+        padded_imgs.append(padded_img)
+
+        m = torch.zeros_like(img[0], dtype=torch.int, device=img.device)
+        padded_mask = torch.nn.functional.pad(m, (0, padding[2], 0, padding[1]), "constant", 1)
+        padded_masks.append(padded_mask.to(torch.bool))
+
+    tensor = torch.stack(padded_imgs)
+    mask = torch.stack(padded_masks)
+
+    return NestedTensor(tensor, mask=mask)
+```
+
+### PostProcess
+
+预测结果解码，由第二步我们可以获得预测结果，shape分别为[batch_size, 100, num_classes + 1]，[batch_size, 100, 4]的数据。
+
+在DETR中，并不存在先验框，也就不需要对先验框进行调整获得预测框。
+
+回归预测结果前两个系数代表中心点坐标，后两个系数代表预测框宽高。由于回归预测结果取了sigmoid，所以值在0-1之间，直接乘上输入图片的宽高就是预测框在原图上的宽高了。
+
+分类预测结果代表这个预测框的种类。前num_classes个系数代表所区分类别的概率，1代表为背景概率。解码过程非常简单，下面代码中输出的output就是预测结果。
+
+```python
+class PostProcess(nn.Module):
+    """ This module converts the model's output into the format expected by the coco api"""
+    @torch.no_grad()
+    def forward(self, outputs, target_sizes):
+        """ Perform the computation
+        Parameters:
+            outputs: raw outputs of the model
+            target_sizes: tensor of dimension [batch_size x 2] containing the size of each images of the batch
+                          For evaluation, this must be the original image size (before any data augmentation)
+                          For visualization, this should be the image size after data augment, but before padding
+        """
+        out_logits, out_bbox = outputs['pred_logits'], outputs['pred_boxes']
+
+        assert len(out_logits) == len(target_sizes)
+        assert target_sizes.shape[1] == 2
+
+        # 最后一维使用softmax
+        prob = F.softmax(out_logits, -1)
+        # 输出最后一维的最大值对应的scores和labels
+        scores, labels = prob[..., :-1].max(-1)
+
+        # convert to [x0, y0, x1, y1] format
+        boxes = box_ops.box_cxcywh_to_xyxy(out_bbox)
+        # and from relative [0, 1] to absolute [0, height] coordinates
+        img_h, img_w = target_sizes.unbind(1)
+        scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)
+        boxes = boxes * scale_fct[:, None, :]
+
+        results = [{'scores': s, 'labels': l, 'boxes': b} for s, l, b in zip(scores, labels, boxes)]
+
+        return results
+```
+
+## Train DETR
+
+### Loss
+
+#### Loss组成
+
+loss实际上是网络的预测结果和网络的真实结果的对比。和网络的预测结果一样，网络的损失也由两个部分组成，分别是Reg部分、Cls部分。Reg部分是特征点的回归参数判断、Cls部分是特征点包含的物体的种类。
+
+#### 正样本的匹配过程
+在DETR中，训练时正样本的匹配过程基于匈牙利算法，名字很高级，但是别被吓到，它其实只是做一个匹配。
+
+不管这个算法叫啥，本身它的作用都是用来进行匹配的，我们看看网络的输出和真实框的情况，去掉batch_size维度后，网络的输出为[100, 4]和[100, num_classes + 1]。真实框的shape为[num_gt, 5]，5中前4个系数为真实框的坐标，最后一个系数为真实框的种类。
+
+匹配算法的工作只是将100个预测结果和num_gt个真实框进行匹配就可以。一个真实框只匹配一个预测结果，其它的预测结果作为背景进行拟合。因此，匹配算法的工作是去找到最适合预测num_gt个真实框的num_gt个预测结果。因此我们需要去计算一个代价矩阵（Cost矩阵），用于代表100个预测结果和num_gt个真实框的关系。这是一个[100, gt]的矩阵。
+
+这个代价矩阵由三个部分组成：
+
+    a、计算分类成本。获得预测结果中，该真实框类别对应的预测值，如果预测值越大代表这个预测框预测的越准确，它的成本就越低。
+
+    b、计算预测框和真实框之间的L1成本。获得预测结果中，预测框的坐标，将预测框的坐标和真实框的坐标做一个l1距离，预测的越准，它的成本就越低。
+
+    c、计算预测框和真实框之间的IOU成本。获得预测结果中，预测框的坐标，将预测框的坐标和真实框的坐标做一个IOU距离，预测的越准，它的成本就越低。
+
+三个按照一定的权重相加，就获得了代价矩阵，这是一个[100, gt]的矩阵。
+
+然后根据代价矩阵，使用匈牙利算法计算最低代价的情况。为什么不直接根据代价矩阵选择真实框最接近的预测结果负责预测呢？因为有可能一个预测结果同时最接近两个真实框。匈牙利算法所做的工作其实只是在代价最小的情况下，将预测结果都匹配上真实框。
+
+```python
+class HungarianMatcher(nn.Module):
+    """This class computes an assignment between the targets and the predictions of the network
+
+    For efficiency reasons, the targets don't include the no_object. Because of this, in general,
+    there are more predictions than targets. In this case, we do a 1-to-1 matching of the best predictions,
+    while the others are un-matched (and thus treated as non-objects).
+    """
+
+    def __init__(self, cost_class: float = 1, cost_bbox: float = 1, cost_giou: float = 1):
+        """Creates the matcher
+
+        Params:
+            cost_class: This is the relative weight of the classification error in the matching cost
+            cost_bbox: This is the relative weight of the L1 error of the bounding box coordinates in the matching cost
+            cost_giou: This is the relative weight of the giou loss of the bounding box in the matching cost
+        """
+        super().__init__()
+        # 分类损失矩阵的相对权重
+        self.cost_class = cost_class
+        # 框回归距离损失矩阵的相对权重
+        self.cost_bbox = cost_bbox
+        # 框GIOU损失矩阵的相对权重
+        self.cost_giou = cost_giou
+        assert cost_class != 0 or cost_bbox != 0 or cost_giou != 0, "all costs cant be 0"
+
+    @torch.no_grad()
+    def forward(self, outputs, targets):
+        """ Performs the matching
+
+        Params:
+            outputs: This is a dict that contains at least these entries:
+                 "pred_logits": Tensor of dim [batch_size, num_queries, num_classes] with the classification logits
+                 "pred_boxes": Tensor of dim [batch_size, num_queries, 4] with the predicted box coordinates
+
+            targets: This is a list of targets (len(targets) = batch_size), where each target is a dict containing:
+                 "labels": Tensor of dim [num_target_boxes] (where num_target_boxes is the number of ground-truth
+                           objects in the target) containing the class labels
+                 "boxes": Tensor of dim [num_target_boxes, 4] containing the target box coordinates
+
+        Returns:
+            A list of size batch_size, containing tuples of (index_i, index_j) where:
+                - index_i is the indices of the selected predictions (in order)
+                - index_j is the indices of the corresponding selected targets (in order)
+            For each batch element, it holds:
+                len(index_i) = len(index_j) = min(num_queries, num_target_boxes)
+        """
+        bs, num_queries = outputs["pred_logits"].shape[:2]
+
+        # We flatten to compute the cost matrices in a batch
+        # 前两维平铺
+        out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)  # [batch_size * num_queries, num_classes]
+        out_bbox = outputs["pred_boxes"].flatten(0, 1)  # [batch_size * num_queries, 4]
+
+        # Also concat the target labels and boxes
+        # 真实标签数据的分类与框分别拼接
+        tgt_ids = torch.cat([v["labels"] for v in targets])
+        tgt_bbox = torch.cat([v["boxes"] for v in targets])
+
+        # Compute the classification cost. Contrary to the loss, we don't use the NLL,
+        # but approximate it in 1 - proba[target class].
+        # The 1 is a constant that doesn't change the matching, it can be ommitted.
+        cost_class = -out_prob[:, tgt_ids]
+
+        # Compute the L1 cost between boxes
+        # 计算每个输出框[x,y,x,y]与真实框[x,y,x,y]的L1距离，得到[len(out_bbox),len(tgt_bbox)]
+        cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
+
+        # Compute the giou cost betwen boxes
+        cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
+
+        # Final cost matrix
+        C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
+        C = C.view(bs, num_queries, -1).cpu()
+
+        sizes = [len(v["boxes"]) for v in targets]
+        indices = [linear_sum_assignment(c[i]) for i, c in enumerate(C.split(sizes, -1))]
+        return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices]
+
 ```
