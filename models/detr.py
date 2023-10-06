@@ -89,7 +89,7 @@ class DETR(nn.Module):
 class PostProcess(nn.Module):
     """ This module converts the model's output into the format expected by the coco api"""
     @torch.no_grad()
-    def forward(self, outputs, target_sizes):
+    def forward(self, outputs, target_sizes, confidence=0.5):
         """ Perform the computation
         Parameters:
             outputs: raw outputs of the model
@@ -112,6 +112,18 @@ class PostProcess(nn.Module):
         scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)
         boxes = boxes * scale_fct[:, None, :]
 
+        # outputs = torch.cat([
+        #         torch.unsqueeze(boxes[:, :, 1], -1),
+        #         torch.unsqueeze(boxes[:, :, 0], -1),
+        #         torch.unsqueeze(boxes[:, :, 3], -1),
+        #         torch.unsqueeze(boxes[:, :, 2], -1),
+        #         torch.unsqueeze(scores, -1),
+        #         torch.unsqueeze(labels.float(), -1),    
+        #     ], -1)
+        
+        # results = []
+        # for output in outputs:
+        #     results.append(output[output[:, 4] > confidence])
         results = [{'scores': s, 'labels': l, 'boxes': b} for s, l, b in zip(scores, labels, boxes)]
 
         return results
