@@ -6,6 +6,7 @@ import datetime
 from typing import Iterable
 import math
 import sys
+from tqdm import tqdm
 
 from models import build_model
 import util.misc as utils
@@ -18,6 +19,7 @@ class Trainer:
         # print("git:\n  {}\n".format(utils.get_sha()))
         self.args = args
         self.device = torch.device(args.device)
+        self.main_process = utils.is_main_process()
         self.model, self.criterion, self.postprocessors = self.build_mcp(args)
         self.model.to(self.device)
         # self.model_without_ddp = self.model.module if args.distributed else self.model
@@ -28,6 +30,11 @@ class Trainer:
         self.data_loader_train = self.build_data_loader(self.dataset_train, is_train=True)
         self.data_loader_val = self.build_data_loader(self.dataset_val, is_train=False)
         self.base_ds = get_coco_api_from_dataset(self.dataset_val)
+
+        self.pbar = enumerate(self.data_loader_train)
+        if self.main_process:
+            self.pbar = tqdm(self.pbar, total=len(self.data_loader_train), ncols=100,
+                             bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')
 
     def build_mcp(self, args):
         # Build your model here
@@ -111,9 +118,13 @@ class Trainer:
             metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled, **loss_dict_reduced_unscaled)
             metric_logger.update(class_error=loss_dict_reduced['class_error'])
             metric_logger.update(lr=optimizer.param_groups[0]["lr"])
+            if self.main_process and torch.cuda.is_available():
+                self.pbar.update(1)
+                self.pbar.set_description(f'Epoch: {epoch}')
+                self.pbar.set_postfix(**{k: f'{v.global_avg:.6f}' for k, v in metric_logger.meters.items()})
         # gather the stats from all processes
         metric_logger.synchronize_between_processes()
-        print("Averaged stats:", metric_logger)
+        # print("Averaged stats:", metric_logger)
         return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
     def train(self):

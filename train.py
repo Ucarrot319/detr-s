@@ -88,7 +88,7 @@ def get_args_parser():
     return parser
 
 '''
-python -m torch.distributed.launch --nproc_per_node=3 \
+python -m torch.distributed.launch --nproc_per_node=1 \
     --use_env train.py --coco_path /data/COCO2017/images/  \
     --output_dir run/box_model \
     --epochs 3 --device cuda --num_workers 8 --batch_size 2
